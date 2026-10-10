@@ -1,0 +1,879 @@
+@preconcurrency import Metal
+import QuartzCore
+import RealityKit
+import Synchronization
+
+/// The window's scene mirror: the game's own 3D draws, rebuilt each frame as one RealityKit mesh,
+/// so RealityKit renders the game's world from the viewer's real eyes and the window shows it from
+/// any angle, with nothing to fill in behind the hero however far you lean. The approach is the
+/// SHAR port's; this file is the TPVR port's (visionos/App/Sources/MirrorScene.swift), fed by
+/// host/scene_mirror.h: vertices in the camera's view space, each draw's material reduced to
+/// texture x colour + colour per vertex, textures as RGBA.
+///
+/// One mesh with a part per solid material, refilled each frame (RealityKit's cost is in refilling a
+/// mesh, not in its size: SHAR measured ~0.14 ms a mesh, so one per draw capped it at 45 Hz), and
+/// each blended part in an entity of its own, in the game's order. It sits in the portal's world,
+/// placed so the game's camera is where a viewer's eye would be for the picture to be exact: the
+/// window spans the camera's view a little short of its focus.
+@MainActor
+final class MirrorScene {
+    let root = Entity()
+    private let entity = ModelEntity()
+    // Behind everything: where the game drew nothing the mirror can show (past the edges of its
+    // view, seen from the side), black, as the game's own picture is, not the room.
+    private let backdrop = ModelEntity(mesh: .generatePlane(width: 1, height: 1),
+                                       materials: [UnlitMaterial(color: .black)])
+    private var mesh: LowLevelMesh?
+    // A new mesh's resource is made once the mesh has parts (update(upTo:)).
+    private var resourcePending = false
+    private let queue: MTLCommandQueue
+    // Blended parts, each in an entity of its own in the window's sort group, in the game's order
+    // (as the SHAR port does). In the one mesh, all with the frame's bounds, RealityKit ordered them
+    // itself, by distance from the eye: layered ones (the sky's, the ground's second passes, a
+    // horse's dust) took turns as the head moved, and flickered (TPVR).
+    @MainActor private final class BlendSlot {
+        let entity = ModelEntity()
+        var mesh: LowLevelMesh?
+        var material: MaterialKey?
+        var order: Int32 = .min
+    }
+    private var blendSlots: [BlendSlot] = []
+    private var sortGroup: ModelSortGroup?
+    private var sortOrder: Int32 = 0
+    private var remap: [Int32] = []  // a frame vertex's index in the slot being filled, -1 when none
+
+    // MirrorMaterials(Wrap).usda: kind ("Opaque", "Cutout", "Blend") + wrap ("RR", "CC"...).
+    private var templates: [String: ShaderGraphMaterial] = [:]
+    private var textures: [UInt64: TextureResource] = [:]
+    // Their textures, for the ones the game updates (shadows read back each frame).
+    private var lowLevelTextures: [UInt64: LowLevelTexture] = [:]
+    private var failedTextures: Set<UInt64> = []
+    private struct PendingTexture { let id: UInt64; let pixels: Data; let width: Int; let height: Int; let mipmapped: Bool; let cutout: Bool }
+    private var pendingTextures: [PendingTexture] = []
+    private var wantedTextures: Set<UInt64> = []
+    private var texturesArrived = false
+    // Textures the game let go of (unused for 15 s), kept with their materials, in the order they
+    // went: one that comes back (an area returned to, a menu closed) has the id it had and finds
+    // them as they were. Dropped, its return added a material to the level's list and set the list
+    // again, which can cost the renderer a frame of the whole level: TPVR flashed for minutes after
+    // a load. Up to parkedBudget bytes; past it, the longest gone go for good.
+    private var parked: [UInt64] = []
+    private var parkedSet: Set<UInt64> = []
+    private static let parkedBudget = 48 << 20
+    private var white: TextureResource?
+    private var materials: [MaterialKey: ShaderGraphMaterial] = [:]
+    // The entity's material list, which the solid parts index; it grows as materials appear, and is
+    // set again only then (setting it may cost RealityKit's renderer a frame).
+    private var materialList: [MaterialKey] = []
+    private var materialIndex: [MaterialKey: Int] = [:]
+    private var materialReady: [Bool] = []
+    private var serial: UInt64 = 0
+    private(set) var hasScene = false
+    /// The view distance the glass is at (game units), as last placed.
+    private(set) var plane: Float = 1
+    /// How much depths are compressed for a narrow view (1 for a normal one), as last placed.
+    private(set) var depthScale: Float = 1
+    /// The narrowest view laid out as it is (half-width as a tangent): the picture is exact from
+    /// 1 / (2 tan) window widths in front of the glass, and a telephoto shot (TPVR's cutscenes go
+    /// down to 0.27) put that point two widths out, so anyone nearer saw past what the game drew.
+    /// A narrower view has its depths compressed (along the window's axis, not the camera's rays),
+    /// which shears the world: TPVR's 0.7 squashed Animal Crossing's town, whose camera is a
+    /// telephoto (20 degrees high, 0.31 across at 16:9, looking down 44 degrees), to 0.45 of its
+    /// depth, and the trees stood at about 48 degrees to the ground instead of 90 ("an angle to
+    /// everything", Trevor, headset). At 0.3 the town and the scripted shots (40 degrees high,
+    /// 0.65 across: the train) are laid out as they are: the right shape, tilted only by the
+    /// camera's pitch, and the town's picture is exact from 1.6 window widths out (a 1.2 m
+    /// window, 1.9 m), about where a window is watched from. The town's 0.31 is close to the
+    /// line: a narrower camera than the game's own would be squashed a little again.
+    static let minViewTangent: Float = 0.3
+    private static let cullTest = ProcessInfo.processInfo.environment["ACVR_TEST_MIRROR_CULL"] ?? ""
+    private static let addRed = ProcessInfo.processInfo.environment["ACVR_TEST_MIRROR_ADD_RED"] == "1"
+
+    private var timing = (updates: 0, frames: 0, seconds: 0.0, since: CACurrentMediaTime(), vertices: 0, parts: 0, drawn: 0,
+                          total: 0)
+    private var counts = (texturesMade: 0, texturesFailed: 0, materialSets: 0, meshesMade: 0, fills: 0)
+    // Of an update's time: filling the mesh, and setting its parts (where RealityKit waits for its
+    // renderer: a mesh with more vertex attributes doubled it).
+    private var stages = (fill: 0.0, parts: 0.0)
+
+    private struct MaterialKey: Hashable {
+        var texture: UInt64
+        var kind: UInt32
+        var wrap: String
+        var flags: UInt32
+        var cutoff: UInt8
+        var weights: SIMD8<Int8>
+
+        init(_ part: acvr_visionos_mirror_part) {
+            texture = part.texture
+            kind = part.kind
+            let letter = { (mode: UInt8) in mode == UInt8(ACVR_VISIONOS_MIRROR_WRAP_CLAMP) ? "C" : mode == UInt8(ACVR_VISIONOS_MIRROR_WRAP_MIRROR) ? "M" : "R" }
+            wrap = letter(part.wrap_s) + letter(part.wrap_t)
+            flags = part.flags & (ACVR_VISIONOS_MIRROR_CULL_BACK | ACVR_VISIONOS_MIRROR_CULL_FRONT | ACVR_VISIONOS_MIRROR_DEPTH_WRITE | ACVR_VISIONOS_MIRROR_DEPTH_TEST
+                                  | ACVR_VISIONOS_MIRROR_BACKGROUND)
+            cutoff = part.kind == ACVR_VISIONOS_MIRROR_PART_CUTOUT ? UInt8(clamping: Int((part.cutoff * 255).rounded())) : 0
+            let quantise = { (value: Float) in Int8(clamping: Int((value * 16).rounded())) }
+            weights = part.kind == ACVR_VISIONOS_MIRROR_PART_BLEND
+                ? SIMD8(quantise(part.colour_base), quantise(part.colour_alpha), quantise(part.opacity_base),
+                        quantise(part.opacity_alpha), quantise(part.opacity_luma), 0, 0, 0)
+                : .zero
+        }
+    }
+
+    init() async throws {
+        guard let queue = MTLCreateSystemDefaultDevice()?.makeCommandQueue() else { throw CancellationError() }
+        self.queue = queue
+        for kind in ["Opaque", "Cutout", "Blend"] {
+            templates[kind + "RR"] = try await ShaderGraphMaterial(named: "/Root/Mirror\(kind)_RR", from: "MirrorMaterials.usda", in: .main)
+        }
+        // The other wrap modes, separately: without them, textures repeat.
+        do {
+            for wrap in ["RC", "RM", "CR", "CC", "CM", "MR", "MC", "MM"] {
+                for kind in ["Opaque", "Cutout", "Blend"] {
+                    templates[kind + wrap] = try await ShaderGraphMaterial(
+                        named: "/Root/Mirror\(kind)_\(wrap)", from: "MirrorMaterialsWrap.usda", in: .main)
+                }
+            }
+        } catch {
+            print("[ACVR] mirror: clamped and mirrored texture materials failed to load, so they repeat: \(error)")
+        }
+        white = Self.makeTexture(queue: queue, pixels: [255, 255, 255, 255], width: 1, height: 1)
+        entity.isEnabled = false
+        root.addChild(entity)
+        backdrop.isEnabled = false
+        root.addChild(backdrop)
+    }
+
+    /// Draws the level as `order` in `group`, its blended parts after it in the game's order, and the
+    /// backdrop just before it; what the window lays over the level goes from `order` + 1 +
+    /// maxBlendedParts. The backdrop must be in the group too: left out, RealityKit drew it after the
+    /// level now and then (one Simulator launch in five or so) and, as the group's models don't
+    /// settle depth against what's outside it, it covered the whole level.
+    func sort(in group: ModelSortGroup, order: Int32) {
+        backdrop.components.set(ModelSortGroupComponent(group: group, order: order - 1))
+        entity.components.set(ModelSortGroupComponent(group: group, order: order))
+        sortGroup = group
+        sortOrder = order
+        for slot in blendSlots { slot.order = .min }
+    }
+    static let maxBlendedParts: Int32 = 1 << 16
+    // Test runs: ACVR_TEST_MIRROR_ONE_MESH=1 keeps the blended parts in the one mesh.
+    private static let oneMesh = ProcessInfo.processInfo.environment["ACVR_TEST_MIRROR_ONE_MESH"] == "1"
+
+    /// Takes the game's newest mirror frame no later than game frame `upTo` (the window frame shown
+    /// with it) into the mesh. False while there's no 3D scene to show (the window then shows the
+    /// game's flat picture).
+    func update(upTo: UInt32) -> Bool {
+        let start = CACurrentMediaTime()
+        defer { report(start) }
+        var frame = acvr_visionos_mirror_frame()
+        guard acvr_visionos_mirror_acquire(&frame, upTo) else { return false }
+        takeTextures(frame, start: start)
+        guard frame.serial != serial else { return hasScene }
+        serial = frame.serial
+        timing.frames += 1
+        timing.total += 1
+        guard frame.scene, frame.index_count > 0, frame.part_count > 0, frame.tan_half_x > 0,
+              let vertices = frame.vertices, let indices = frame.indices, let parts = frame.parts else {
+            entity.isEnabled = false
+            backdrop.isEnabled = false
+            for slot in blendSlots { slot.entity.isEnabled = false }
+            hasScene = false
+            return false
+        }
+        last = (Int(frame.vertex_count), Int(frame.index_count), Int(frame.part_count), last.blended)
+        let fillStart = CACurrentMediaTime()
+        let filled = fill(vertices: vertices, vertexCount: Int(frame.vertex_count), indices: indices,
+                          indexCount: Int(frame.index_count))
+        stages.fill += CACurrentMediaTime() - fillStart
+        guard filled, let mesh else { return hasScene }
+
+        let keys = (0..<Int(frame.part_count)).map { MaterialKey(parts[$0]) }
+        let inSlot = { (index: Int) in parts[index].kind == ACVR_VISIONOS_MIRROR_PART_BLEND && !Self.oneMesh }
+        // The level's list holds the solid parts' materials only: a new particle's doesn't set it.
+        updateMaterials((0..<keys.count).filter { !inSlot($0) }.map { keys[$0] })
+        let low = SIMD3(frame.bounds_min.0, frame.bounds_min.1, frame.bounds_min.2)
+        let high = SIMD3(frame.bounds_max.0, frame.bounds_max.1, frame.bounds_max.2)
+        let pad = (high - low) * 0.05 + 1
+        let bounds = BoundingBox(min: low - pad, max: high + pad)
+        // A part whose texture is still on its way waits: drawn white, it flashed.
+        let partsStart = CACurrentMediaTime()
+        defer { stages.parts += CACurrentMediaTime() - partsStart }
+        // The solid parts in the one mesh; each blended one in a slot of its own (fillBlend).
+        var drawn: [LowLevelMesh.Part] = []
+        var blendedParts: [(index: Int, material: ShaderGraphMaterial)] = []
+        for index in 0..<Int(frame.part_count) {
+            let part = parts[index]
+            if inSlot(index) {
+                if let material = material(for: keys[index]) {
+                    if blendedParts.count < Int(Self.maxBlendedParts) { blendedParts.append((index, material)) }
+                } else {
+                    wantedTextures.insert(keys[index].texture)
+                }
+                continue
+            }
+            guard let materialIndex = materialIndex[keys[index]], materialReady[materialIndex] else {
+                wantedTextures.insert(keys[index].texture)
+                continue
+            }
+            drawn.append(LowLevelMesh.Part(indexOffset: Int(part.first_index) * 4, indexCount: Int(part.index_count),
+                                           topology: .triangle, materialIndex: materialIndex, bounds: bounds))
+        }
+        mesh.parts.replaceAll(drawn)
+        fillSlots(blendedParts, parts: parts, keys: keys, vertices: vertices, vertexCount: Int(frame.vertex_count),
+                  indices: indices)
+        timing.drawn += drawn.count + last.blended
+        if resourcePending, !drawn.isEmpty {
+            // Made from the mesh only once it has parts. Made from a new mesh with none and given its
+            // parts in the same update, the level stayed invisible for the whole run, now and then
+            // (one Simulator launch in five or so), with the backdrop showing in its place.
+            do {
+                let resource = try MeshResource(from: mesh)
+                if entity.model == nil {
+                    entity.model = ModelComponent(mesh: resource, materials: currentMaterials())
+                } else {
+                    entity.model?.mesh = resource
+                }
+                resourcePending = false
+            } catch {
+                print("[ACVR] mirror: the mesh's resource failed: \(error)")
+            }
+        }
+        place(frame)
+        if Self.dumpFrame == timing.total {
+            dump(frame)
+        }
+        entity.isEnabled = true
+        backdrop.isEnabled = true
+        hasScene = true
+        timing.vertices += Int(frame.vertex_count)
+        timing.parts += Int(frame.part_count)
+        return true
+    }
+
+    /// View space into window units: the window spans the camera's view at the frame's `plane` (a
+    /// little short of its focus, nothing nearer), so the camera sits 1 / (2 tan) window widths in
+    /// front of the glass. A narrower view than minViewTangent (a telephoto shot) has its depths
+    /// compressed to the picture it would have from a camera that close, which is the same picture.
+    private func place(_ frame: acvr_visionos_mirror_frame) {
+        let plane = max(frame.plane, 1e-3)
+        let tan = frame.tan_half_x
+        let depthScale = tan / max(tan, Self.minViewTangent)
+        self.plane = plane
+        self.depthScale = depthScale
+        let scale = 1 / (2 * plane * tan)
+        root.scale = SIMD3(scale, scale, scale * depthScale)
+        root.position = [0, 0, scale * depthScale * plane]
+        let far = max(-frame.bounds_min.2, plane) * 1.05
+        let wide = 2 * far * max(tan, Self.minViewTangent) * 8
+        backdrop.position = [0, 0, -far]
+        backdrop.scale = [wide, wide, 1]
+    }
+
+    // MARK: - The mesh
+
+    /// position float3, uv0 float2, the multiplier half4 (vertex colour), the addend half2 x 2
+    /// (uv1, uv2): acvr_visionos_mirror_vertex.
+    private static func descriptor(vertices: Int, indices: Int) -> LowLevelMesh.Descriptor {
+        LowLevelMesh.Descriptor(
+            vertexCapacity: vertices,
+            vertexAttributes: [.init(semantic: .position, format: .float3, layoutIndex: 0, offset: 0),
+                               .init(semantic: .uv0, format: .float2, layoutIndex: 0, offset: 12),
+                               .init(semantic: .color, format: .half4, layoutIndex: 0, offset: 20),
+                               .init(semantic: .uv1, format: .half2, layoutIndex: 0, offset: 28),
+                               .init(semantic: .uv2, format: .half2, layoutIndex: 0, offset: 32)],
+            vertexLayouts: [.init(bufferIndex: 0, bufferStride: 36)],
+            indexCapacity: indices, indexType: .uint32)
+    }
+
+    private func fill(vertices: UnsafePointer<acvr_visionos_mirror_vertex>, vertexCount: Int,
+                      indices: UnsafePointer<UInt32>, indexCount: Int) -> Bool {
+        let fits = mesh.map { $0.vertexCapacity >= vertexCount && $0.indexCapacity >= indexCount } ?? false
+        if !fits {
+            do {
+                // Grown in steps, not doubled: each write goes into a fresh buffer of the mesh's
+                // capacity, and past some size between 3.2 and 4.3 MB those cost RealityKit 12 to 15
+                // ms instead of 0.3 (TPVR, 83,500 vertices: 0.35 ms in a 3.2 MB buffer, 11 to 15 ms
+                // in the 4.7 MB that doubling made). 36 bytes a vertex.
+                mesh = try LowLevelMesh(descriptor: Self.descriptor(
+                    vertices: max(65536, vertexCount.roundedUp(to: 8192)),
+                    indices: max(131072, indexCount.roundedUp(to: 16384))))
+                resourcePending = true
+                counts.meshesMade += 1
+            } catch {
+                print("[ACVR] mirror: a mesh of \(vertexCount) vertices failed: \(error)")
+                return false
+            }
+        }
+        guard let mesh else { return false }
+        counts.fills += 1
+        // Into fresh buffers RealityKit swaps in once written (SHAR: written in place, the
+        // headset's renderer drew between the vertices and the indices).
+        mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { raw in
+            raw.copyMemory(from: UnsafeRawBufferPointer(start: vertices, count: vertexCount * 36))
+            // Test runs: ACVR_TEST_MIRROR_ADD_RED=1 makes every vertex mul 0, add opaque red: the
+            // window should be solid red where the mirror draws (it checks uv1/uv2 reach the materials).
+            if Self.addRed {
+                for index in 0..<vertexCount { Self.paintRed(raw.baseAddress! + index * 36) }
+            }
+        }
+        mesh.replaceUnsafeMutableIndices { raw in
+            raw.copyMemory(from: UnsafeRawBufferPointer(start: indices, count: indexCount * 4))
+        }
+        return true
+    }
+
+    /// ACVR_TEST_MIRROR_ADD_RED: the vertex at `vertex` gets mul 0, add opaque red.
+    private static func paintRed(_ vertex: UnsafeMutableRawPointer) {
+        let red: [UInt16] = [0, 0, 0, 0, 0x3C00, 0, 0, 0x3C00]  // half 1.0 = 0x3C00
+        red.withUnsafeBytes { (vertex + 20).copyMemory(from: $0.baseAddress!, byteCount: 16) }
+    }
+
+    /// Each blended part into the slot that had its material last frame, if one did: by position, a
+    /// dust puff appearing mid-list moved every later part to another slot, its geometry and
+    /// material changing at once (which RealityKit may not show in the same frame).
+    private func fillSlots(_ blendedParts: [(index: Int, material: ShaderGraphMaterial)],
+                           parts: UnsafePointer<acvr_visionos_mirror_part>, keys: [MaterialKey],
+                           vertices: UnsafePointer<acvr_visionos_mirror_vertex>, vertexCount: Int,
+                           indices: UnsafePointer<UInt32>) {
+        var taken = [Bool](repeating: false, count: blendSlots.count)
+        var byMaterial: [MaterialKey: [Int]] = [:]
+        for (s, slot) in blendSlots.enumerated().reversed() {
+            if let key = slot.material { byMaterial[key, default: []].append(s) }
+        }
+        var slotFor = [Int](repeating: -1, count: blendedParts.count)
+        for (k, part) in blendedParts.enumerated() {
+            if let s = byMaterial[keys[part.index]]?.popLast() {
+                slotFor[k] = s
+                taken[s] = true
+            }
+        }
+        var free = 0
+        var blended = 0
+        for (k, part) in blendedParts.enumerated() {
+            var s = slotFor[k]
+            if s < 0 {
+                while free < taken.count && taken[free] { free += 1 }
+                if free == taken.count {
+                    let slot = BlendSlot()
+                    root.addChild(slot.entity)
+                    blendSlots.append(slot)
+                    taken.append(false)
+                }
+                s = free
+                taken[s] = true
+            }
+            if fillBlend(blendSlots[s], order: k, part: parts[part.index], key: keys[part.index], material: part.material,
+                         vertices: vertices, vertexCount: vertexCount, indices: indices) {
+                blended += 1
+            } else {
+                blendSlots[s].entity.isEnabled = false
+            }
+        }
+        for (s, slot) in blendSlots.enumerated() where !taken[s] { slot.entity.isEnabled = false }
+        last.blended = blended
+    }
+
+    /// The frame's blended part `order` (the game's order) into `slot`: only the vertices it uses
+    /// (most of the frame's are solid), its indices renumbered, one part. False: the slot shows nothing.
+    private func fillBlend(_ slot: BlendSlot, order k: Int, part: acvr_visionos_mirror_part, key: MaterialKey,
+                           material: ShaderGraphMaterial, vertices: UnsafePointer<acvr_visionos_mirror_vertex>,
+                           vertexCount: Int, indices: UnsafePointer<UInt32>) -> Bool {
+        let first = Int(part.first_index), count = Int(part.index_count)
+        guard count > 0 else { return false }
+        if remap.count < vertexCount { remap = [Int32](repeating: -1, count: vertexCount) }
+        var used: [UInt32] = []
+        used.reserveCapacity(count)
+        var local = [UInt32](repeating: 0, count: count)
+        for i in 0..<count {
+            let v = Int(indices[first + i])
+            guard v < vertexCount else { continue }
+            if remap[v] < 0 {
+                remap[v] = Int32(used.count)
+                used.append(UInt32(v))
+            }
+            local[i] = UInt32(remap[v])
+        }
+        for v in used { remap[Int(v)] = -1 }
+        guard !used.isEmpty else { return false }
+        var low = SIMD3<Float>(repeating: .infinity), high = SIMD3<Float>(repeating: -.infinity)
+        for v in used {
+            let p = vertices[Int(v)].position
+            let point = SIMD3(p.0, p.1, p.2)
+            low = simd_min(low, point)
+            high = simd_max(high, point)
+        }
+        let pad = (high - low) * 0.05 + 1
+        let bounds = BoundingBox(min: low - pad, max: high + pad)
+        // A bigger mesh replaces the slot's only once its resource is made: kept on failure, the
+        // slot would go on drawing the old resource while the next frames wrote into the new mesh.
+        var fresh = false
+        var target = slot.mesh
+        if target.map({ $0.vertexCapacity < used.count || $0.indexCapacity < count }) ?? true {
+            guard let made = try? LowLevelMesh(descriptor: Self.descriptor(
+                vertices: max(256, used.count.nextPowerOfTwo), indices: max(768, count.nextPowerOfTwo))) else {
+                return false
+            }
+            target = made
+            fresh = true
+        }
+        guard let mesh = target else { return false }
+        mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { raw in
+            for (j, v) in used.enumerated() {
+                let at = raw.baseAddress! + j * 36
+                at.copyMemory(from: vertices + Int(v), byteCount: 36)
+                if Self.addRed { Self.paintRed(at) }
+            }
+        }
+        mesh.replaceUnsafeMutableIndices { raw in
+            local.withUnsafeBytes { raw.copyMemory(from: $0) }
+        }
+        mesh.parts.replaceAll([LowLevelMesh.Part(indexOffset: 0, indexCount: count, topology: .triangle,
+                                                 materialIndex: 0, bounds: bounds)])
+        // The resource only once the mesh has its part (RealityKit rules: made from a mesh without
+        // one, it now and then never drew). The material only when the slot's key changes: set again
+        // each frame, it may cost the renderer a frame.
+        if fresh {
+            guard let resource = try? MeshResource(from: mesh) else { return false }
+            slot.mesh = mesh
+            slot.entity.model = ModelComponent(mesh: resource, materials: [material])
+            slot.material = key
+        } else if slot.material != key {
+            slot.entity.model?.materials = [material]
+            slot.material = key
+        }
+        let order = sortOrder + 1 + Int32(k)
+        if slot.order != order, let sortGroup {
+            slot.entity.components.set(ModelSortGroupComponent(group: sortGroup, order: order))
+            slot.order = order
+        }
+        slot.entity.isEnabled = true
+        return true
+    }
+
+    // MARK: - Materials
+
+    private func updateMaterials(_ keys: [MaterialKey]) {
+        var changed = false
+        // Counting new materials, not parts: blended parts in the game's order repeat theirs, and
+        // counting parts cleared and set the list every frame of a busy scene (SHAR's review), which
+        // may cost the renderer a frame of the whole level.
+        let fresh = Set(keys).filter { materialIndex[$0] == nil }.count
+        if materialList.count + fresh > 1024 {
+            materialList = []
+            materialIndex = [:]
+            materialReady = []
+            changed = true
+        }
+        if texturesArrived {
+            texturesArrived = false
+            changed = changed || materialList.indices.contains { !materialReady[$0] && material(for: materialList[$0]) != nil }
+        }
+        for key in keys where materialIndex[key] == nil {
+            materialIndex[key] = materialList.count
+            materialList.append(key)
+            changed = true
+        }
+        guard changed else { return }
+        counts.materialSets += 1
+        materialReady = materialList.map { material(for: $0) != nil }
+        entity.model?.materials = currentMaterials()
+    }
+
+    /// The material list the parts index (a stand-in where a texture is still on its way).
+    private func currentMaterials() -> [any Material] {
+        materialList.map { material(for: $0) ?? templates["OpaqueRR"]! }
+    }
+
+    private func material(for key: MaterialKey) -> ShaderGraphMaterial? {
+        if let made = materials[key] { return made }
+        let texture = key.texture == 0 || failedTextures.contains(key.texture) ? white : textures[key.texture]
+        guard let texture else { return nil }
+        let kind = key.kind == ACVR_VISIONOS_MIRROR_PART_CUTOUT ? "Cutout" : key.kind == ACVR_VISIONOS_MIRROR_PART_BLEND ? "Blend" : "Opaque"
+        guard var made = templates[kind + key.wrap] ?? templates[kind + "RR"] else { return nil }
+        try? made.setParameter(name: "Frame", value: .textureResource(texture))
+        switch key.kind {
+        case ACVR_VISIONOS_MIRROR_PART_CUTOUT:
+            try? made.setParameter(name: "Cutoff", value: .float(Float(max(key.cutoff, 1)) / 255))
+        case ACVR_VISIONOS_MIRROR_PART_BLEND:
+            for (index, name) in ["ColourBase", "ColourAlpha", "OpacityBase", "OpacityAlpha", "OpacityLuma"].enumerated() {
+                try? made.setParameter(name: name, value: .float(Float(key.weights[index]) / 16))
+            }
+            // Blended surfaces hide what's behind them only where the game's do.
+            made.writesDepth = key.flags & ACVR_VISIONOS_MIRROR_DEPTH_WRITE != 0
+        default:
+            break
+        }
+        // A blend the game draws without a depth test draws over everything, except the sky's
+        // layers: pushed behind the level, the level hides them where it stands.
+        made.readsDepth = key.flags & (ACVR_VISIONOS_MIRROR_DEPTH_TEST | ACVR_VISIONOS_MIRROR_BACKGROUND) != 0 || key.kind != ACVR_VISIONOS_MIRROR_PART_BLEND
+        made.faceCulling = key.flags & ACVR_VISIONOS_MIRROR_CULL_BACK != 0 ? .back
+            : key.flags & ACVR_VISIONOS_MIRROR_CULL_FRONT != 0 ? .front : .none
+        // Test runs: ACVR_TEST_MIRROR_CULL=none draws both sides, =flip culls the other side.
+        switch Self.cullTest {
+        case "none": made.faceCulling = .none
+        case "flip": made.faceCulling = made.faceCulling == .back ? .front : made.faceCulling == .front ? .back : .none
+        default: break
+        }
+        if materials.count > 4096 { materials.removeAll(keepingCapacity: true) }
+        materials[key] = made
+        return made
+    }
+
+    // MARK: - Textures
+
+    private func takeTextures(_ frame: acvr_visionos_mirror_frame, start: CFTimeInterval) {
+        if let list = frame.textures {
+            for index in 0..<Int(frame.texture_count) {
+                let texture = list[index]
+                let count = Int(texture.width) * Int(texture.height) * 4
+                guard let rgba = texture.rgba, count > 0 else { continue }
+                // Back after being let go: the same texture, still here (below).
+                if parkedSet.remove(texture.id) != nil {
+                    parked.removeAll { $0 == texture.id }
+                }
+                // A mipmapped id is its pixels (scene_mirror.h): the one made stands.
+                if texture.mipmapped, textures[texture.id] != nil { continue }
+                // New pixels for one already made (a shadow, each frame): replaced in place.
+                if let existing = lowLevelTextures[texture.id], Self.updatesInPlace(existing, width: Int(texture.width),
+                                                                                    height: Int(texture.height),
+                                                                                    cutout: texture.cutout) {
+                    Self.upload(queue: queue, pixels: rgba, width: Int(texture.width), height: Int(texture.height), into: existing)
+                    continue
+                }
+                let pending = PendingTexture(id: texture.id, pixels: Data(bytes: rgba, count: count),
+                                             width: Int(texture.width), height: Int(texture.height),
+                                             mipmapped: texture.mipmapped, cutout: texture.cutout)
+                // A newer read-back of one still waiting replaces it.
+                if let waiting = pendingTextures.firstIndex(where: { $0.id == texture.id }) {
+                    pendingTextures[waiting] = pending
+                } else {
+                    pendingTextures.append(pending)
+                }
+            }
+        }
+        // After the new ones: a texture can arrive and be gone in the same frame. An area's
+        // textures go together, a few hundred at once: one pass over each collection.
+        // Those made are parked, not dropped; one that couldn't be made (drawn white) loses its
+        // materials, so that when it comes back and is made, its parts wait for it and the list is
+        // set once.
+        if let removed = frame.removed, frame.removed_count > 0 {
+            let gone = Set((0..<Int(frame.removed_count)).map { removed[$0] })
+            var failedGone: Set<UInt64> = []
+            for id in gone where !parkedSet.contains(id) {
+                if textures[id] != nil {
+                    parked.append(id)
+                    parkedSet.insert(id)
+                } else if failedTextures.remove(id) != nil {
+                    failedGone.insert(id)
+                }
+            }
+            if !failedGone.isEmpty { forgetMaterials(using: failedGone) }
+            pendingTextures.removeAll { gone.contains($0.id) }
+            dropParked(beyond: Self.parkedBudget)
+        }
+        // Wanted ones first, then a few milliseconds' worth an update, at least one.
+        if !wantedTextures.isEmpty {
+            let wanted = pendingTextures.filter { wantedTextures.contains($0.id) }
+            pendingTextures = wanted + pendingTextures.filter { !wantedTextures.contains($0.id) }
+            wantedTextures.removeAll()
+        }
+        var made = 0
+        while !pendingTextures.isEmpty && (made == 0 || CACurrentMediaTime() - start < 0.004) {
+            let pending = pendingTextures.removeFirst()
+            if Self.dumpFrame >= 0 {
+                dumpTextures[pending.id] = pending
+            }
+            // Read back again before its first was made: into the texture already there.
+            if let existing = lowLevelTextures[pending.id],
+               Self.updatesInPlace(existing, width: pending.width, height: pending.height, cutout: pending.cutout) {
+                pending.pixels.withUnsafeBytes {
+                    Self.upload(queue: queue, pixels: $0.bindMemory(to: UInt8.self).baseAddress!, width: pending.width,
+                                height: pending.height, into: existing)
+                }
+                made += 1
+                continue
+            }
+            if let (lowLevel, resource) = makeTexture(pending) {
+                // A new resource for an id already drawn (a resized render target): materials made
+                // with the old one would keep drawing it.
+                if textures[pending.id] != nil || failedTextures.contains(pending.id) {
+                    forgetMaterials(using: [pending.id])
+                }
+                failedTextures.remove(pending.id)
+                textures[pending.id] = resource
+                lowLevelTextures[pending.id] = lowLevel
+                counts.texturesMade += 1
+            } else {
+                failedTextures.insert(pending.id)
+                counts.texturesFailed += 1
+            }
+            texturesArrived = true
+            made += 1
+        }
+    }
+
+    /// Drops the materials made with these textures and marks their list entries not ready, so the
+    /// parts wait for the texture (again) and the list is set anew once it's there. A blended part's
+    /// slot forgets its material too: it sets one only when its key changes, so it stayed white.
+    private func forgetMaterials(using ids: Set<UInt64>) {
+        materials = materials.filter { !ids.contains($0.key.texture) }
+        for (index, key) in materialList.enumerated() where ids.contains(key.texture) {
+            materialReady[index] = false
+        }
+        for slot in blendSlots where slot.material.map({ ids.contains($0.texture) }) == true {
+            slot.material = nil
+        }
+    }
+
+    /// Lets the longest-gone parked textures go for good, with their materials, until the rest fit.
+    private func dropParked(beyond budget: Int) {
+        var bytes = parked.reduce(0) { $0 + Self.bytes(of: lowLevelTextures[$1]) }
+        guard bytes > budget else { return }
+        var dropped: Set<UInt64> = []
+        while bytes > budget, !parked.isEmpty {
+            let id = parked.removeFirst()
+            parkedSet.remove(id)
+            bytes -= Self.bytes(of: lowLevelTextures[id])
+            textures[id] = nil
+            lowLevelTextures[id] = nil
+            dropped.insert(id)
+        }
+        forgetMaterials(using: dropped)
+    }
+
+    private static func bytes(of texture: LowLevelTexture?) -> Int {
+        guard let descriptor = texture?.descriptor else { return 0 }
+        let level = descriptor.width * descriptor.height * 4
+        return descriptor.mipmapLevelCount > 1 ? level * 4 / 3 : level
+    }
+
+    /// Whether new pixels can go into the texture already made: the same size, and its mipmaps (if
+    /// any) ones the GPU makes (a cut-out's are made on the CPU, so it gets a new texture).
+    private static func updatesInPlace(_ texture: LowLevelTexture, width: Int, height: Int, cutout: Bool) -> Bool {
+        texture.descriptor.width == width && texture.descriptor.height == height
+            && (texture.descriptor.mipmapLevelCount == 1 || !cutout)
+    }
+
+    private func makeTexture(_ texture: PendingTexture) -> (LowLevelTexture, TextureResource)? {
+        let levels = texture.mipmapped && texture.cutout ? Self.coverageMipmaps(texture) : nil
+        return (levels ?? texture.pixels).withUnsafeBytes {
+            Self.makeTexture(queue: queue, pixels: $0.baseAddress!, width: texture.width, height: texture.height,
+                             mipmapped: texture.mipmapped, levelsIncluded: levels != nil)
+        }
+    }
+
+    private static func makeTexture(queue: MTLCommandQueue, pixels: [UInt8], width: Int, height: Int) -> TextureResource? {
+        pixels.withUnsafeBytes { makeTexture(queue: queue, pixels: $0.baseAddress!, width: width, height: height)?.1 }
+    }
+
+    /// New level-zero pixels into a texture already made.
+    private static func upload(queue: MTLCommandQueue, pixels: UnsafePointer<UInt8>, width: Int, height: Int,
+                               into texture: LowLevelTexture) {
+        guard let staging = queue.device.makeBuffer(bytes: pixels, length: width * height * 4) else {
+            report("a \(width)x\(height) texture update: no staging buffer")
+            return
+        }
+        blit(staging, into: texture, sizes: [(width, height)], generate: texture.descriptor.mipmapLevelCount > 1,
+             queue: queue, label: "a \(width)x\(height) texture update")
+    }
+
+    /// The staging buffer's levels into the texture (the GPU making the rest with `generate`). One the
+    /// GPU reports failing is tried again, once, into the same texture, so what draws it needn't
+    /// change. (The SHAR port's headset-only "black void", ground and sky gone, was failed uploads
+    /// the Simulator never showed: they'd have gone unnoticed here.)
+    @discardableResult
+    private static func blit(_ staging: MTLBuffer, into texture: LowLevelTexture, sizes: [(Int, Int)], generate: Bool,
+                             queue: MTLCommandQueue, label: String, retries: Int = 1) -> Bool {
+        guard let commands = queue.makeCommandBuffer(), let blit = commands.makeBlitCommandEncoder() else {
+            report("\(label): no command buffer")
+            return false
+        }
+        let destination = texture.replace(using: commands)
+        var offset = 0
+        for (level, (levelWidth, levelHeight)) in sizes.enumerated() {
+            blit.copy(from: staging, sourceOffset: offset, sourceBytesPerRow: levelWidth * 4,
+                      sourceBytesPerImage: levelWidth * levelHeight * 4,
+                      sourceSize: MTLSize(width: levelWidth, height: levelHeight, depth: 1), to: destination,
+                      destinationSlice: 0, destinationLevel: level, destinationOrigin: MTLOrigin())
+            offset += levelWidth * levelHeight * 4
+        }
+        if generate { blit.generateMipmaps(for: destination) }
+        blit.endEncoding()
+        uploadsInFlight.add(1, ordering: .relaxed)
+        commands.addCompletedHandler { done in
+            uploadsInFlight.subtract(1, ordering: .relaxed)
+            guard let error = done.error else { return }
+            let message = "\(label): upload failed\(retries > 0 ? ", trying again" : ""): \(error)"
+            DispatchQueue.main.async {
+                report(message)
+                if retries > 0 {
+                    Self.blit(staging, into: texture, sizes: sizes, generate: generate, queue: queue, label: label,
+                              retries: retries - 1)
+                }
+            }
+        }
+        commands.commit()
+        return true
+    }
+
+    // The first few failures, word for word.
+    private static var reports = 0
+    private static func report(_ message: String) {
+        reports += 1
+        if reports <= 20 { print("[ACVR] mirror: \(message)") }
+    }
+
+    /// RGBA8 (sRGB) into a texture, its mipmaps made by the GPU or, with `levelsIncluded`, given
+    /// one after another in `pixels`.
+    private static func makeTexture(queue: MTLCommandQueue, pixels: UnsafeRawPointer, width: Int, height: Int,
+                                    mipmapped: Bool = false, levelsIncluded: Bool = false) -> (LowLevelTexture, TextureResource)? {
+        let levels = mipmapped ? Int(log2(Double(max(width, height)))) + 1 : 1
+        let descriptor = LowLevelTexture.Descriptor(pixelFormat: .rgba8Unorm_srgb, width: width, height: height,
+                                                    mipmapLevelCount: levels, textureUsage: [.shaderRead, .renderTarget])
+        let label = "a \(width)x\(height) texture"
+        let texture: LowLevelTexture
+        do { texture = try LowLevelTexture(descriptor: descriptor) } catch {
+            report("\(label): LowLevelTexture failed: \(error)")
+            return nil
+        }
+        let sizes = (0..<(levelsIncluded ? levels : 1)).map { (max(1, width >> $0), max(1, height >> $0)) }
+        guard let staging = queue.device.makeBuffer(bytes: pixels, length: sizes.reduce(0) { $0 + $1.0 * $1.1 * 4 }) else {
+            report("\(label): no staging buffer")
+            return nil
+        }
+        // (It reports its own failures.)
+        guard Self.blit(staging, into: texture, sizes: sizes, generate: levels > 1 && !levelsIncluded, queue: queue,
+                        label: label) else { return nil }
+        do { return (texture, try TextureResource(from: texture)) } catch {
+            report("\(label): TextureResource failed: \(error)")
+            return nil
+        }
+    }
+
+    /// A cut-out texture's mipmaps (SHAR's): each texel the alpha-weighted mean of the four below
+    /// it, its alpha scaled so as many texels pass a half alpha test as at full size. A box filter
+    /// alone thins foliage with distance, and its edges shimmer.
+    private static func coverageMipmaps(_ texture: PendingTexture) -> Data? {
+        var width = texture.width, height = texture.height
+        guard width > 1 || height > 1 else { return nil }
+        var level = [UInt8](texture.pixels)
+        let covered = { (pixels: [UInt8], scale: Float) -> Int in
+            stride(from: 3, to: pixels.count, by: 4).reduce(0) { $0 + (Float(pixels[$1]) * scale >= 127.5 ? 1 : 0) }
+        }
+        let coverage = Float(covered(level, 1)) / Float(width * height)
+        var chain = Data(level)
+        while width > 1 || height > 1 {
+            let nextWidth = max(1, width / 2), nextHeight = max(1, height / 2)
+            var next = [UInt8](repeating: 0, count: nextWidth * nextHeight * 4)
+            for y in 0..<nextHeight {
+                for x in 0..<nextWidth {
+                    var colour = SIMD3<Float>.zero, plain = SIMD3<Float>.zero, alpha: Float = 0
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let at = (min(y * 2 + dy, height - 1) * width + min(x * 2 + dx, width - 1)) * 4
+                        let texel = SIMD3<Float>(Float(level[at]), Float(level[at + 1]), Float(level[at + 2]))
+                        let a = Float(level[at + 3])
+                        colour += texel * a
+                        plain += texel
+                        alpha += a
+                    }
+                    let rgb = alpha > 0 ? colour / alpha : plain / 4
+                    let at = (y * nextWidth + x) * 4
+                    next[at] = UInt8(rgb.x.rounded())
+                    next[at + 1] = UInt8(rgb.y.rounded())
+                    next[at + 2] = UInt8(rgb.z.rounded())
+                    next[at + 3] = UInt8((alpha / 4).rounded())
+                }
+            }
+            var low: Float = 0, high: Float = 8
+            for _ in 0..<12 {
+                let middle = (low + high) / 2
+                if Float(covered(next, middle)) / Float(nextWidth * nextHeight) < coverage { low = middle } else { high = middle }
+            }
+            for at in stride(from: 3, to: next.count, by: 4) { next[at] = UInt8(min(255, (Float(next[at]) * high).rounded())) }
+            chain.append(contentsOf: next)
+            (level, width, height) = (next, nextWidth, nextHeight)
+        }
+        return chain
+    }
+
+    // MARK: - Test runs
+
+    // ACVR_TEST_MIRROR_DUMP=<frame> writes that mirror frame raw into Documents/mirror-dump:
+    // vertices.bin (36-byte vertices), indices.bin (u32), parts.txt, camera.txt, and the
+    // textures made so far (tex-<id>-<w>x<h>.rgba).
+    private static let dumpFrame = ProcessInfo.processInfo.environment["ACVR_TEST_MIRROR_DUMP"].flatMap(Int.init) ?? -1
+    private var dumpTextures: [UInt64: PendingTexture] = [:]
+
+    private func dump(_ frame: acvr_visionos_mirror_frame) {
+        let folder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("mirror-dump")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        if let vertices = frame.vertices {
+            try? Data(bytes: vertices, count: Int(frame.vertex_count) * 36).write(to: folder.appendingPathComponent("vertices.bin"))
+        }
+        if let indices = frame.indices {
+            try? Data(bytes: indices, count: Int(frame.index_count) * 4).write(to: folder.appendingPathComponent("indices.bin"))
+        }
+        var parts = ""
+        for index in 0..<Int(frame.part_count) {
+            let p = frame.parts![index]
+            parts += "\(p.first_index) \(p.index_count) \(p.texture) \(p.kind) \(p.flags) \(p.cutoff) "
+                + "\(p.colour_base) \(p.colour_alpha) \(p.opacity_base) \(p.opacity_alpha) \(p.opacity_luma) "
+                + "\(p.wrap_s) \(p.wrap_t)\n"
+        }
+        try? parts.write(to: folder.appendingPathComponent("parts.txt"), atomically: true, encoding: .utf8)
+        let camera = "\(frame.tan_half_x) \(frame.tan_half_y) \(frame.focus) \(frame.bounds_min) \(frame.bounds_max)\n"
+        try? camera.write(to: folder.appendingPathComponent("camera.txt"), atomically: true, encoding: .utf8)
+        for (id, texture) in dumpTextures {
+            try? texture.pixels.write(to: folder.appendingPathComponent("tex-\(id)-\(texture.width)x\(texture.height).rgba"))
+        }
+        print("[ACVR] mirror frame dumped: \(frame.vertex_count) vertices, \(frame.part_count) parts, \(dumpTextures.count) textures")
+    }
+
+    // MARK: - Report
+
+    /// What the mirror holds, for the window's memory log (WindowMemoryGuard).
+    var diagnostics: String {
+        let textureBytes = lowLevelTextures.values.reduce(0) { $0 + Self.bytes(of: $1) }
+        let waitingBytes = pendingTextures.reduce(0) { $0 + $1.pixels.count }
+        return "\(lastReport); last frame \(last.vertices) vertices, \(last.indices) indices, \(last.parts) parts "
+            + "(\(last.blended) blended, in \(blendSlots.count) slots); "
+            + "\(lowLevelTextures.count) textures (~\(textureBytes >> 20) MB, \(parked.count) parked; "
+            + "\(counts.texturesMade) made, \(counts.texturesFailed) failed), \(pendingTextures.count) waiting "
+            + "(\(waitingBytes >> 20) MB), \(Self.uploadsInFlight.load(ordering: .relaxed)) uploads in flight, "
+            + "\(materials.count) materials (\(materialList.count) listed), mesh room for "
+            + "\(mesh?.vertexCapacity ?? 0) vertices (\(counts.meshesMade) meshes made, \(counts.fills) fills)"
+    }
+    private var last = (vertices: 0, indices: 0, parts: 0, blended: 0)
+    /// The last 5-s report's rates, for the memory log (the headset doesn't keep stdout).
+    private var lastReport = "no report yet"
+    /// Texture uploads committed to the GPU and not yet done, for the memory log.
+    nonisolated private static let uploadsInFlight = Atomic<Int>(0)
+
+    /// Every 5 s: how often RealityKit updates, how many game frames came, and what they cost here.
+    private func report(_ start: CFTimeInterval) {
+        timing.updates += 1
+        timing.seconds += CACurrentMediaTime() - start
+        guard start - timing.since > 5 else { return }
+        let updates = Double(timing.updates), frames = Double(max(timing.frames, 1))
+        print(String(format: "[ACVR] mirror: %.0f updates/s, %.0f frames/s, %.2f ms an update (fill %.2f, parts %.2f), "
+                     + "%.0f vertices and %.0f parts (%.0f drawn) "
+                     + "a frame; %d materials, list set %d times; textures %d made, %d failed, %d waiting",
+                     updates / (start - timing.since), Double(timing.frames) / (start - timing.since),
+                     timing.seconds / updates * 1000, stages.fill / updates * 1000, stages.parts / updates * 1000,
+                     Double(timing.vertices) / frames, Double(timing.parts) / frames, Double(timing.drawn) / frames,
+                     materials.count, counts.materialSets, counts.texturesMade, counts.texturesFailed, pendingTextures.count))
+        lastReport = String(format: "%.0f updates/s, %.0f frames/s, %.2f ms an update (fill %.2f, parts %.2f)",
+                            updates / (start - timing.since), Double(timing.frames) / (start - timing.since),
+                            timing.seconds / updates * 1000, stages.fill / updates * 1000, stages.parts / updates * 1000)
+        timing = (0, 0, 0, start, 0, 0, 0, timing.total)
+        stages = (0, 0)
+        counts.materialSets = 0
+    }
+}
+
+private extension Int {
+    var nextPowerOfTwo: Int { self <= 1 ? 1 : 1 << (Int.bitWidth - (self - 1).leadingZeroBitCount) }
+    func roundedUp(to step: Int) -> Int { (self + step - 1) / step * step }
+}

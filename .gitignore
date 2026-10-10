@@ -1,0 +1,116 @@
+# IDE folders
+.idea/
+.vs/
+.vscode/*
+
+# Caches
+__pycache__
+.mypy_cache
+.cache/
+
+# Original files
+orig/*/*
+!orig/*/.gitkeep
+*.dol
+*.rel
+*.elf
+*.o
+*.map
+*.MAP
+
+# Game data, saves, and runtime files — never commit these
+*.iso
+*.gcm
+*.ciso
+*.gci
+*.bin
+rom/
+save/
+settings.ini
+keybindings.ini
+*.log
+
+# Build files
+build/
+build32/
+.ninja_*
+build.ninja
+
+# decompctx output
+ctx.*
+*.ctx
+
+# Generated configs
+objdiff.json
+compile_commands.json
+
+# Miscellaneous
+/*.txt
+!requirements.txt
+*.exe
+
+# For saving work files into (like IDB)
+temp/
+
+# Ignore the N64 SDK headers since we download them
+# NOTE: include/PR/gbi.h and include/PR/ultratypes.h are force-tracked
+# (git add -f) because they have TARGET_PC modifications for LE bitfields.
+# configure.py skips download when they already exist.
+include/PR/
+include/gcc/
+include/compiler/gcc/stdlib.h
+
+# Android build
+.gradle/
+local.properties
+app/.cxx/
+app/build/
+*.apk
+*.aab
+# downloaded by the fetchThirdParty Gradle task
+app/src/main/cpp/third_party/
+# game data and generated content never belong in the repo
+*.iso
+*.gcm
+*.ciso
+*.nkit*
+*.tgc
+*.dds
+translations/
+texture_pack/
+
+# release signing (never commit)
+keystore.properties
+*.jks
+*.p12
+*.keystore
+
+# SDL2 and other third-party sources/builds for the visionOS port (fetched locally)
+visionos/third_party/
+
+# visionOS port: local builds, run dirs, the disc and saves never go in
+/build-*/
+visionos/build/
+visionos/DerivedData/
+*.gci
+*.raw
+save/
+shots/
+settings.ini
+keybindings.ini
+shader_cache.bin
+.DS_Store
+.scratch/
+
+# visionOS app project (xcodegen generates it from visionos/App/project.yml)
+visionos/App/ACVRVision.xcodeproj/
+# Standalone Quest packages and private signing material
+quest/.local/
+quest/out/
+*.apk
+*.keystore
+*.jks
+
+# Local only, never committed: the release check's private terms, agent settings
+.release-private-terms
+.claude/settings.local.json

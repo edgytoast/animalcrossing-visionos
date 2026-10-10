@@ -1,0 +1,8 @@
+_ac_pc_main
+_g_pc_metal_device
+_g_pc_metal_present_hook
+_g_pc_window_w
+_g_pc_window_h
+_g_pc_running
+_pcm_*
+_pc_audio_set_paused

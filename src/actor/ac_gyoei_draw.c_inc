@@ -1,0 +1,310 @@
+enum {
+    aGYO_ANIME_PAT_TYPE_NONE,
+    aGYO_ANIME_PAT_TYPE_FAST,
+    aGYO_ANIME_PAT_TYPE_SLOW,
+
+    aGYO_ANIME_PAT_TYPE_NUM
+};
+
+static int aGYO_anime_ptn[] = {
+    aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_FAST,
+    aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_FAST,
+    aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_FAST, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW, aGYO_ANIME_PAT_TYPE_SLOW,
+    aGYO_ANIME_PAT_TYPE_NONE, aGYO_ANIME_PAT_TYPE_NONE, aGYO_ANIME_PAT_TYPE_NONE, aGYO_ANIME_PAT_TYPE_NONE,
+    aGYO_ANIME_PAT_TYPE_NONE,
+};
+
+static int aGYO_frame_ptn_fast[] = { 1, 1, 0, 0, 2, 2, 0, 0 };
+static int aGYO_frame_ptn_slow[] = { 1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0 };
+
+static int aGYO_current_anime_frame(aGYO_CTRL_ACTOR* ctrl) {
+    int idx = ctrl->anim_frame;
+
+    switch (aGYO_anime_ptn[ctrl->gyo_type]) {
+        case aGYO_ANIME_PAT_TYPE_FAST:
+            if (idx < 0 || idx >= ARRAY_COUNT(aGYO_frame_ptn_fast)) {
+                idx = 0;
+            }
+            return aGYO_frame_ptn_fast[idx];
+        case aGYO_ANIME_PAT_TYPE_SLOW:
+            if (idx < 0 || idx >= ARRAY_COUNT(aGYO_frame_ptn_slow)) {
+                idx = 0;
+            }
+            return aGYO_frame_ptn_slow[idx];
+        default:
+            return 0;
+    }
+}
+
+static int aGYO_anime_frame(aGYO_CTRL_ACTOR* ctrl) {
+    int idx = ctrl->anim_frame;
+    int ret;
+
+    idx++;
+    switch (aGYO_anime_ptn[ctrl->gyo_type]) {
+        case aGYO_ANIME_PAT_TYPE_FAST:
+            if (idx >= ARRAY_COUNT(aGYO_frame_ptn_fast)) {
+                idx = 0;
+                if ((ctrl->gyo_flags & 0x200) != 0) {
+                    ctrl->swork2--;
+                }
+            }
+
+            ret = aGYO_frame_ptn_fast[idx];
+            break;
+        case aGYO_ANIME_PAT_TYPE_SLOW:
+            if (idx >= ARRAY_COUNT(aGYO_frame_ptn_slow)) {
+                idx = 0;
+                if ((ctrl->gyo_flags & 0x200) != 0) {
+                    ctrl->swork2--;
+                }
+            }
+
+            ret = aGYO_frame_ptn_slow[idx];
+            break;
+        default:
+            idx = 0;
+            ret = 0;
+            break;
+    }
+
+    ctrl->anim_frame = idx;
+    return ret;
+}
+
+#ifdef TARGET_PC
+#include "pc_vr.h"
+#include "ac_uki.h"
+
+/* Only the current rod's caught fish uses this visual billboard. Its world
+ * position still drives the rod, release, collision, and ordinary shadow. */
+static int aGYO_vr_catch_matrix(const aGYO_CTRL_ACTOR* ctrl, GAME_PLAY* play, f32 correction_y, MtxF* out) {
+    PLAYER_ACTOR* player = GET_PLAYER_ACTOR(play);
+    UKI_ACTOR* rod;
+    float pose[12];
+    if (player == NULL ||
+        (player->now_main_index != mPlayer_INDEX_NOTICE_ROD && player->now_main_index != mPlayer_INDEX_PUTAWAY_ROD) ||
+        play->submenu.menu_type != mSM_OVL_NONE || play->submenu.current_menu_type != mSM_OVL_NONE) {
+        return FALSE;
+    }
+    rod = (UKI_ACTOR*)player->fishing_rod_actor_p;
+    if (rod == NULL || ctrl->linked_actor != (ACTOR*)rod || rod->child_actor != (ACTOR*)ctrl ||
+        ctrl->draw_type != aGYO_DRAW_TYPE_FISH || !pc_vr_item_presentation_mtx(pose)) {
+        return FALSE;
+    }
+    out->xx = pose[0]; out->xy = pose[1]; out->xz = pose[2]; out->xw = pose[3];
+    out->yx = pose[4]; out->yy = pose[5]; out->yz = pose[6]; out->yw = pose[7] - correction_y;
+    out->zx = pose[8]; out->zy = pose[9]; out->zz = pose[10]; out->zw = pose[11];
+    out->wx = out->wy = out->wz = 0.0f; out->ww = 1.0f;
+    return TRUE;
+}
+#endif
+
+static int aGYO_draw_ticks(aGYO_CTRL_ACTOR* ctrl, GAME* game) {
+    int ticks;
+
+    ctrl->draw_accum += (f32)game->graph->dt_num_60fps_frames;
+    ticks = (int)ctrl->draw_accum;
+    if (ticks > 0) {
+        ctrl->draw_accum -= (f32)ticks;
+        if (ticks > 4) {
+            ticks = 4;
+        }
+    }
+
+    return ticks;
+}
+
+static int aGYO_anime_frame_ticks(aGYO_CTRL_ACTOR* ctrl, int ticks) {
+    int frame = aGYO_current_anime_frame(ctrl);
+    int tick;
+
+    for (tick = 0; tick < ticks; tick++) {
+        frame = aGYO_anime_frame(ctrl);
+    }
+
+    return frame;
+}
+
+static void aGYO_actor_draw_fish(GRAPH* graph, aGYO_CTRL_ACTOR* ctrl, GAME* game) {
+    static f32 aGYO_hosei_y[] = {
+        0.0f, 0.0f, 2.2f, 2.2f, 2.2f, 0.0f, 1.5f, 2.2f, 0.0f, 2.2f, 2.2f, 2.2f, 1.5f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 2.2f, 1.5f, 2.2f, 1.5f, 0.0f, 0.0f, 2.2f, 2.2f, 0.0f, 0.0f, 0.0f,
+        0.0f, 2.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    };
+
+    GAME_PLAY* play = (GAME_PLAY*)game;
+    int frame;
+    int ticks = aGYO_draw_ticks(ctrl, game);
+
+    Matrix_translate(((ACTOR*)ctrl)->world.position.x, ((ACTOR*)ctrl)->world.position.y - aGYO_hosei_y[ctrl->gyo_type],
+                     ((ACTOR*)ctrl)->world.position.z, MTX_LOAD);
+    Matrix_mult(&play->billboard_matrix, MTX_MULT);
+#ifdef TARGET_PC
+    {
+        MtxF presentation_matrix;
+        if (aGYO_vr_catch_matrix(ctrl, play, aGYO_hosei_y[ctrl->gyo_type], &presentation_matrix)) {
+            Matrix_put(&presentation_matrix);
+        }
+    }
+#endif
+
+    if (ctrl->gyo_type < (aGYO_TYPE_WHALE + 1) && (ctrl->gyo_flags & 0x200) != 0) {
+        int cnt;
+        int tick;
+
+        for (tick = 0; tick < ticks; tick++) {
+            if (ctrl->pattern_subcounter == 0) {
+                cnt = 0;
+            } else {
+                cnt = --ctrl->pattern_subcounter;
+            }
+
+            if (cnt != 0) {
+                if (aGYO_anime_ptn[ctrl->gyo_type] == aGYO_ANIME_PAT_TYPE_FAST) {
+                    ctrl->move_counter += 0xE38;
+                } else {
+                    ctrl->move_counter += 0xAAA;
+                }
+            } else {
+                if (ctrl->pattern_counter == 0) {
+                    cnt = 0;
+                } else {
+                    cnt = --ctrl->pattern_counter;
+                }
+
+                if (cnt == 0) {
+                    ctrl->pattern_counter = (s16)RANDOM(15);
+
+                    if (aGYO_anime_ptn[ctrl->gyo_type] == aGYO_ANIME_PAT_TYPE_FAST) {
+                        ctrl->pattern_subcounter = 9;
+                    } else {
+                        ctrl->pattern_subcounter = 12;
+                    }
+
+                    if (RANDOM_F(2.0f) < 1.0f) {
+                        ctrl->move_counter = DEG2SHORT_ANGLE2(0.0f);
+                    } else {
+                        ctrl->move_counter = DEG2SHORT_ANGLE2(180.0f);
+                    }
+                }
+            }
+        }
+
+        ctrl->move_angle = DEG2SHORT_ANGLE2(13 * sin_s(ctrl->move_counter));
+        Matrix_RotateY(ctrl->move_angle, MTX_MULT);
+    }
+
+    Matrix_scale(((ACTOR*)ctrl)->scale.x, ((ACTOR*)ctrl)->scale.y, ((ACTOR*)ctrl)->scale.z, MTX_MULT);
+
+    if ((ctrl->gyo_flags & 0x200) != 0 && ctrl->swork2 <= 0) {
+        int cnt;
+        int tick;
+
+        for (tick = 0; tick < ticks; tick++) {
+            if (ctrl->swork3 == 0) {
+                cnt = 0;
+            } else {
+                cnt = --ctrl->swork3;
+            }
+
+            if (cnt == 0) {
+                ctrl->swork2 = RANDOM(3) + 1;
+                ctrl->swork3 = RANDOM2(10) + 15;
+            }
+        }
+
+        frame = 0;
+    } else {
+        frame = aGYO_anime_frame_ticks(ctrl, ticks);
+    }
+
+    OPEN_POLY_OPA_DISP(graph);
+
+    gSPMatrix(POLY_OPA_DISP++, _Matrix_to_Mtx_new(graph), G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPDisplayList(POLY_OPA_DISP++, ((Gfx**)aGYO_displayList[ctrl->gyo_type])[(int)(frame * 0.5f)]);
+
+    CLOSE_POLY_OPA_DISP(graph);
+
+    {
+        static xyz_t offset0 = { 0.0f, 0.0f, 0.0f };
+
+        mAc_UnagiActorShadow((ACTOR*)ctrl, game, offset0);
+    }
+}
+
+extern Gfx act_gyoei02_00_modelT[];
+
+static void aGYO_actor_draw_gyoei(GRAPH* graph, aGYO_CTRL_ACTOR* ctrl, GAME* game) {
+    s16 angleX;
+    s16 angleY;
+    int idx0;
+    int idx1;
+    u32 t;
+
+    angleX = ((ACTOR*)ctrl)->shape_info.rotation.x;
+    angleY = ((ACTOR*)ctrl)->shape_info.rotation.y + DEG2SHORT_ANGLE2(180.0f);
+    t = (u32)ctrl->fwork0;
+    idx0 = aGYO_2tile_texture_idx[t][0];
+    idx1 = aGYO_2tile_texture_idx[t][1];
+
+    if ((ctrl->gyo_flags & 0x100) != 0) {
+        int alpha = (ctrl->work0 - 10) * 6;
+
+        if (alpha <= 0) {
+            alpha = 0;
+        }
+
+        ctrl->alpha = alpha;
+    }
+
+    Matrix_translate(((ACTOR*)ctrl)->world.position.x, ((ACTOR*)ctrl)->world.position.y,
+                     ((ACTOR*)ctrl)->world.position.z, MTX_LOAD);
+    Matrix_RotateX(angleX, MTX_MULT);
+    Matrix_RotateY(angleY, MTX_MULT);
+    Matrix_scale(((ACTOR*)ctrl)->scale.x * 0.4f, ((ACTOR*)ctrl)->scale.y, ((ACTOR*)ctrl)->scale.z, MTX_MULT);
+
+    OPEN_DISP(graph);
+
+    gSPMatrix(NEXT_POLY_XLU_DISP, _Matrix_to_Mtx_new(graph), G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPSegment(NEXT_POLY_XLU_DISP, ANIME_1_TXT_SEG, aGYO_texture_table[idx0]);
+    gSPSegment(NEXT_POLY_XLU_DISP, ANIME_2_TXT_SEG, aGYO_texture_table[idx1]);
+    gDPSetPrimColor(NEXT_POLY_XLU_DISP, 0, aGYO_prim_f[t], 0, 0, 0, ctrl->alpha);
+    gSPDisplayList(NEXT_POLY_XLU_DISP, act_gyoei02_00_modelT);
+
+    CLOSE_DISP(graph);
+}
+
+static void aGYO_actor_draw(ACTOR* actorx, GAME* game) {
+    GYOEI_ACTOR* gyoei = (GYOEI_ACTOR*)actorx;
+    aGYO_CTRL_ACTOR* ctrl = gyoei->ctrl;
+    GRAPH* graph = game->graph;
+    int i;
+
+    Matrix_push();
+    _texture_z_light_fog_prim(graph);
+    _texture_z_light_fog_prim_xlu(graph);
+
+    for (i = 0; i < aGYO_MAX_GYOEI; i++) {
+        if (ctrl->exist == TRUE && ((ACTOR*)ctrl)->drawn &&
+            (((ACTOR*)ctrl)->state_bitfield & (ACTOR_STATE_NO_CULL | ACTOR_STATE_NO_DRAW_WHILE_CULLED)) ==
+                (ACTOR_STATE_NO_CULL | ACTOR_STATE_NO_DRAW_WHILE_CULLED)) {
+            if (ctrl->draw_type == aGYO_DRAW_TYPE_FISH) {
+                aGYO_actor_draw_fish(graph, ctrl, game);
+            } else {
+                aGYO_actor_draw_gyoei(graph, ctrl, game);
+            }
+        }
+
+        ctrl++;
+    }
+
+    Matrix_pull();
+}

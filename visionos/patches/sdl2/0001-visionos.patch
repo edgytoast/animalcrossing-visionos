@@ -1,0 +1,57 @@
+SDL 2.32.10 (tag release-2.32.10, commit 5d24957) -- visionOS fixes for the
+Animal Crossing visionOS port. Apply from the SDL source root:
+
+    git apply /path/to/0001-visionos.patch
+
+1. cmake/sdlchecks.cmake: build the iOS HIDAPI backend (src/hidapi/ios/hid.m)
+   for VISIONOS too. SDL_hidapi.c selects that backend for every
+   __IPHONEOS__ target (visionOS included), so with SDL_HIDAPI=ON (needed for
+   SDL_VIRTUAL_JOYSTICK) libSDL2.a otherwise has unresolved PLATFORM_hid_*.
+   Bluetooth is only touched when SDL_HINT_JOYSTICK_HIDAPI_STEAM is set.
+2. src/misc/ios/SDL_sysurl.m: the visionOS guard tests SDL_PLATFORM_VISIONOS,
+   which SDL2 never defines (SDL3 name), so the iOS<10 -[UIApplication openURL:]
+   fallback is compiled and fails ("unavailable on visionOS"). Also test
+   TARGET_OS_VISION.
+3. src/SDL.c: SDL_IsTablet() calls SDL_IsIPad(), which lives in the UIKit video
+   driver; with SDL_VIDEO=OFF on a UIKit platform that is an undefined symbol.
+   Only call it when SDL_VIDEO_DRIVER_UIKIT is built.
+
+diff --git a/cmake/sdlchecks.cmake b/cmake/sdlchecks.cmake
+index ea4c0ff..1d1175f 100644
+--- a/cmake/sdlchecks.cmake
++++ b/cmake/sdlchecks.cmake
+@@ -1256,7 +1256,7 @@ macro(CheckHIDAPI)
+         enable_language(CXX)
+         list(APPEND SOURCE_FILES ${SDL2_SOURCE_DIR}/src/hidapi/android/hid.cpp)
+       endif()
+-      if(IOS OR TVOS)
++      if(IOS OR TVOS OR VISIONOS)
+         list(APPEND SOURCE_FILES ${SDL2_SOURCE_DIR}/src/hidapi/ios/hid.m)
+         set(SDL_FRAMEWORK_COREBLUETOOTH 1)
+       endif()
+diff --git a/src/SDL.c b/src/SDL.c
+index e21b500..fe0506a 100644
+--- a/src/SDL.c
++++ b/src/SDL.c
+@@ -652,7 +652,7 @@ SDL_bool SDL_IsTablet(void)
+ #if defined(__ANDROID__)
+     extern SDL_bool SDL_IsAndroidTablet(void);
+     return SDL_IsAndroidTablet();
+-#elif defined(__IPHONEOS__)
++#elif defined(__IPHONEOS__) && defined(SDL_VIDEO_DRIVER_UIKIT)
+     extern SDL_bool SDL_IsIPad(void);
+     return SDL_IsIPad();
+ #else
+diff --git a/src/misc/ios/SDL_sysurl.m b/src/misc/ios/SDL_sysurl.m
+index 08722ba..05986c2 100644
+--- a/src/misc/ios/SDL_sysurl.m
++++ b/src/misc/ios/SDL_sysurl.m
+@@ -34,7 +34,7 @@ int SDL_SYS_OpenURL(const char *url)
+         if (@available(iOS 10.0, tvOS 10.0, *)) {
+             [[UIApplication sharedApplication] openURL:nsurl options:@{} completionHandler:^(BOOL success) {}];
+         } else {
+-            #ifndef SDL_PLATFORM_VISIONOS   /* Fallback is never available in any version of VisionOS (but correct API always is). */
++            #if !defined(SDL_PLATFORM_VISIONOS) && !(defined(TARGET_OS_VISION) && TARGET_OS_VISION)   /* Fallback is never available in any version of VisionOS (but correct API always is). */
+             [[UIApplication sharedApplication] openURL:nsurl];
+             #endif
+         }
